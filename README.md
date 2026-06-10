@@ -19,17 +19,17 @@ Code, Codex, Aider, and any other terminal app.
 
 ## Why I made this
 
-I type a lot of prose into terminal apps — long prompts for Claude Code and other
+I type a lot of prose into terminal apps — long prompts for **Claude Code**, **Codex** and other
 AI agents, commit messages, SQL, quick notes. None of them spell-check, so my typos
 just sail straight through into prompts and history. My editor has had the red
-squiggly line for twenty years; my terminal never got it.
+squiggly line for years; my terminal never got it.
 
 So I built it. You wrap a terminal program once, and you get that squiggly line
 back — in Claude Code, Aider, Codex, vim, `psql`, your shell, whatever. It only
 shows up when you actually misspell something, and it never changes how the app
 you're running behaves.
 
-And a typo costs more here than in a text editor. To a language model, a
+And a typo costs more here than in a text editor. To a language model (LLM), a
 correctly-spelled word usually maps to a clean, familiar token; a misspelled one
 breaks into odd subword fragments it rarely saw arranged that way in training. So it
 spends effort guessing what you meant — and sometimes guesses wrong and quietly runs
@@ -49,7 +49,7 @@ A few things I cared about while building it:
   underlines your sentences, not your identifiers.
 - **It's quiet by default.** Out of the box you get spelling underlines and nothing
   else. Grammar hints, the suggestion picker, Tab-to-fix — all off until you turn
-  them on.
+  them on from `config`.
 
 ## Install
 

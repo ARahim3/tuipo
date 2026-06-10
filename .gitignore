@@ -4,3 +4,4 @@ CLAUDE.md
 
 # local scratch config (the binary reads ~/.config/tuipo/config.toml, not this)
 /config.toml
+RELEASING.md

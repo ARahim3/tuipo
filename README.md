@@ -9,7 +9,7 @@ but for whatever you type into the terminal.
 [![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](#install)
 [![crates.io](https://img.shields.io/crates/v/tuipo.svg)](https://crates.io/crates/tuipo)
 
-<img src="https://raw.githubusercontent.com/ARahim3/tuipo/main/tuipo_demo1.png" alt="tuipo underlining typos in a Claude Code prompt" width="720">
+<img src="https://raw.githubusercontent.com/ARahim3/tuipo/main/tuipo_demo2.png" alt="tuipo underlining typos in a Claude Code prompt" width="720">
 
 <sub><i>tuipo catching typos in a prompt to Claude Code. It never touches the app it's wrapping — the underlines are drawn on top.</i></sub>
 
@@ -185,12 +185,4 @@ Unless you say otherwise, anything you contribute is licensed the same way.
 
 ---
 
-<sub>
-
-tuipo is an independent project and isn't affiliated with, endorsed by, or sponsored
-by Grammarly, Anthropic (Claude), or anyone else mentioned here. Those names are used
-only to describe what tuipo works with, or — in the case of "Grammarly for your
-terminal" — to give you a quick feel for what it does. It's not the same engine or
-feature set. All trademarks belong to their owners.
-
-</sub>
+<sub>tuipo is an independent project and isn't affiliated with, endorsed by, or sponsored by Grammarly, Anthropic (Claude), or anyone else mentioned here. Those names are only used to describe what tuipo works with, or — for "Grammarly for your terminal" — to give a quick feel for what it does. It's not the same engine or feature set. All trademarks belong to their owners.</sub>

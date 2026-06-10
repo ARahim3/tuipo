@@ -1,0 +1,6 @@
+/target
+CLAUDE.md
+.claude/settings.local.json
+
+# local scratch config (the binary reads ~/.config/tuipo/config.toml, not this)
+/config.toml

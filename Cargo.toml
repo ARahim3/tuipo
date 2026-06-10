@@ -1,0 +1,58 @@
+[package]
+name = "tuipo"
+version = "0.1.0"
+edition = "2024"
+description = "Grammarly-style spell-check for your terminal — underlines typos as you type in any TUI"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ARahim3/tuipo"
+homepage = "https://github.com/ARahim3/tuipo"
+readme = "README.md"
+keywords = ["spellcheck", "terminal", "tui", "cli", "pty"]
+categories = ["command-line-utilities", "text-processing"]
+authors = ["ARahim3 <erahim3@gmail.com>"]
+exclude = ["/tuipo_demo1.png", "/assets/*.png", "/.github", "/CLAUDE.md", "/config.toml", "/RELEASING.md"]
+
+[[bin]]
+name = "tuipo"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+harper-core = "2"
+portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
+signal-hook = "0.3"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+vte = "0.15"
+
+[dev-dependencies]
+assert_cmd = "2"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+# Config for `cargo dist` (https://github.com/axodotdev/cargo-dist). The
+# `cargo-dist-version` and `ci` keys are filled in by `dist init` (see
+# RELEASING.md) so they always match your installed dist version.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+[workspace.metadata.dist]
+# Build prebuilt binaries for these platforms on each tagged release.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+# Ship a curl|sh installer AND a Homebrew formula.
+installers = ["shell", "homebrew"]
+# The tap repo the generated formula is pushed to (create it as an empty
+# public repo named exactly `homebrew-tuipo` — see RELEASING.md).
+tap = "ARahim3/homebrew-tuipo"
+# Only run a dry-run "plan" on PRs; full builds happen on tags.
+pr-run-mode = "plan"

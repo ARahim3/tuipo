@@ -2,14 +2,16 @@
 
 # tuipo
 
-**Grammarly for your terminal** — the red squiggly line you have in your editor,
-but for whatever you type into the terminal.
+**Grammarly for your terminal.**
+
+The red squiggly line from your editor — now for the prompts you type into Claude
+Code, Codex, Aider, and any other terminal app.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](#install)
 [![crates.io](https://img.shields.io/crates/v/tuipo.svg)](https://crates.io/crates/tuipo)
 
-<img src="https://raw.githubusercontent.com/ARahim3/tuipo/main/tuipo_demo2.png" alt="tuipo underlining typos in a Claude Code prompt" width="720">
+<img src="https://raw.githubusercontent.com/ARahim3/tuipo/main/tuipo_demo.gif" alt="tuipo underlining typos in a Claude Code prompt" width="720">
 
 <sub><i>tuipo catching typos in a prompt to Claude Code. It never touches the app it's wrapping — the underlines are drawn on top.</i></sub>
 
@@ -26,6 +28,13 @@ So I built it. You wrap a terminal program once, and you get that squiggly line
 back — in Claude Code, Aider, Codex, vim, `psql`, your shell, whatever. It only
 shows up when you actually misspell something, and it never changes how the app
 you're running behaves.
+
+And a typo costs more here than in a text editor. To a language model, a
+correctly-spelled word usually maps to a clean, familiar token; a misspelled one
+breaks into odd subword fragments it rarely saw arranged that way in training. So it
+spends effort guessing what you meant — and sometimes guesses wrong and quietly runs
+with it. One fat-fingered word in a prompt can nudge a coding agent down the wrong
+path before it's written a line.
 
 A few things I cared about while building it:
 

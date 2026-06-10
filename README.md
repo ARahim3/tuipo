@@ -176,6 +176,23 @@ an automatic fallback to a plain underline where it doesn't (e.g. Apple Terminal
 **How do I turn it off for a bit?**
 `TUIPO_PAINT_OFF=1 tuipo -- <cmd>`, or set `paint = false`.
 
+## Uninstall
+
+Nothing here is sticky:
+
+```bash
+# 1. if you ran `tuipo init`, delete the hook line from your shell rc
+#    (~/.zshrc or ~/.bashrc) — it's the single line containing TUIPO_ACTIVE
+# 2. remove the binary
+brew uninstall tuipo
+brew untap ARahim3/tuipo      # optional: drop the tap too
+# 3. optional: remove your settings + custom dictionary
+rm -rf ~/.config/tuipo
+```
+
+If you skip step 1, no harm done — the hook is guarded (`[[ -x … ]]`), so once the
+binary is gone it simply does nothing. Deleting the line just tidies up the file.
+
 ## Contributing
 
 Issues and PRs welcome. `cargo build`, `cargo test`, and please keep

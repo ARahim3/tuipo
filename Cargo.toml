@@ -49,6 +49,9 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 installers = ["shell", "homebrew"]
 # A GitHub repo to push Homebrew formulas to
 tap = "ARahim3/homebrew-tuipo"
+# Actually publish the generated formula to the tap above (without this, dist
+# builds tuipo.rb but never pushes it — the tap stays empty)
+publish-jobs = ["homebrew"]
 # Which actions to run on pull requests
 pr-run-mode = "plan"
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)

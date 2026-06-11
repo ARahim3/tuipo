@@ -29,12 +29,15 @@ back — in Claude Code, Aider, Codex, vim, `psql`, your shell, whatever. It onl
 shows up when you actually misspell something, and it never changes how the app
 you're running behaves.
 
-And a typo costs more here than in a text editor. To a language model (LLM), a
-correctly-spelled word usually maps to a clean, familiar token; a misspelled one
-breaks into odd subword fragments it rarely saw arranged that way in training. So it
-spends effort guessing what you meant — and sometimes guesses wrong and quietly runs
-with it. One fat-fingered word in a prompt can nudge a coding agent down the wrong
-path before it's written a line.
+To be fair: modern LLMs shrug off everyday typos — mistype "recieve" and Claude
+knows what you meant. But that robustness comes from the model having seen a word
+(and its common misspellings) countless times, so it fades exactly where the
+stakes are highest: rare words, names, and jargon, where the model quietly
+guesses — and an agent doesn't ask, it acts on its guess. It shrinks with model
+size, too: what a frontier model shrugs off, the local Qwen or Gemma behind your
+coding agent has to guess at. Spelling also outlives the prompt: agents echo
+your words into commit messages, PR text, comments, and docs. And plenty of what you type in a terminal is read by humans in the first
+place — commit messages, SQL, notes — where a typo just stays a typo.
 
 A few things I cared about while building it:
 

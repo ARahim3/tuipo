@@ -60,6 +60,30 @@ impl InputState {
         outcome
     }
 
+    /// Feed bytes to the buffer WITHOUT spell-checking each intermediate
+    /// prefix. Used for paste bursts: linting on every byte re-parses the
+    /// whole buffer through harper, so an N-char paste costs O(N²) harper
+    /// passes and stalls the stdin→PTY forwarding for seconds (GH #1). The
+    /// caller MUST call [`Self::refresh`] once after the burst so `issues`
+    /// reflects the final buffer. Boundary still clears the lint cache
+    /// immediately — cheap, and keeps invariants intact if a control byte
+    /// happens to land inside a pasted chunk.
+    pub fn feed_bytes_deferred(&mut self, bytes: &[u8]) -> FeedOutcome {
+        let outcome = self.buffer.feed_bytes(bytes);
+        if let FeedOutcome::Boundary = outcome {
+            self.issues.clear();
+            self.last_checked_version = self.buffer.version();
+        }
+        outcome
+    }
+
+    /// Bring the lint cache in sync with the current buffer. Runs harper
+    /// at most once (no-op when the buffer is unchanged since the last
+    /// check). Pairs with [`Self::feed_bytes_deferred`].
+    pub fn refresh(&mut self) {
+        self.refresh_issues();
+    }
+
     fn refresh_issues(&mut self) {
         let v = self.buffer.version();
         if v == self.last_checked_version {
@@ -109,6 +133,49 @@ mod tests {
             "expected `teh` in issues: {:?}",
             s.issues(),
         );
+    }
+
+    #[test]
+    fn deferred_feed_plus_refresh_matches_per_byte_feed() {
+        // The paste fast-path feeds the whole burst without linting, then
+        // calls refresh() once. The resulting issues must match what the
+        // per-byte path produces — same final buffer, same lints.
+        let text = b"i beleive teh fox jumpd";
+
+        let mut per_byte = InputState::new();
+        for &b in text {
+            per_byte.feed_bytes(&[b]);
+        }
+
+        let mut deferred = InputState::new();
+        deferred.feed_bytes_deferred(text);
+        // Before refresh, the lint cache is intentionally stale (empty).
+        assert!(
+            deferred.issues().is_empty(),
+            "deferred feed must not run harper before refresh",
+        );
+        deferred.refresh();
+
+        let mut a: Vec<&str> = per_byte.issues().iter().map(|i| i.word.as_str()).collect();
+        let mut b: Vec<&str> = deferred.issues().iter().map(|i| i.word.as_str()).collect();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b, "deferred+refresh lints must match per-byte lints");
+        assert_eq!(per_byte.buffer().text(), deferred.buffer().text());
+    }
+
+    #[test]
+    fn refresh_is_noop_when_buffer_unchanged() {
+        // Calling refresh() twice in a row must not re-run harper or
+        // change the issue set — the version guard makes the second call
+        // a no-op.
+        let mut s = InputState::new();
+        s.feed_bytes_deferred(b"teh cat");
+        s.refresh();
+        let first: Vec<String> = s.issues().iter().map(|i| i.word.clone()).collect();
+        s.refresh();
+        let second: Vec<String> = s.issues().iter().map(|i| i.word.clone()).collect();
+        assert_eq!(first, second);
     }
 
     #[test]

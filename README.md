@@ -176,6 +176,14 @@ stays out of the way while you're typing forward.
 macOS and Linux. You get curly red underlines where the terminal supports them, with
 an automatic fallback to a plain underline where it doesn't (e.g. Apple Terminal).
 
+**Does it work with non-English text?**
+Not yet — Harper, the engine underneath, is English-only today. Words from other
+languages in the same alphabet ("ragazzo", "bonjour") will usually get underlined
+as unknown, though loanwords English has absorbed ("croissant", "rendezvous") pass
+clean. The underline is passive — nothing is blocked or changed — and words you mix
+in regularly can go in `~/.config/tuipo/dict.txt` so they're never flagged again.
+If Harper grows other languages, tuipo inherits them.
+
 **How do I turn it off for a bit?**
 `TUIPO_PAINT_OFF=1 tuipo -- <cmd>`, or set `paint = false`.
 

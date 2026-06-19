@@ -233,18 +233,26 @@ fn pump_stdin_to_pty(mut writer: Box<dyn Write + Send>, event_tx: mpsc::Sender<R
             Ok(0) => break,
             Ok(n) => {
                 let chunk = &buf[..n];
-                // Chunk-shape paste detection: hosts that don't enable
-                // bracketed paste (e.g. Claude Code's current build)
-                // deliver a paste as a single multi-byte read whose
-                // `\n` bytes lie in the *middle* — interactive typing
-                // can't produce that because Enter blocks the read at
-                // the line boundary. Flag the buffer for the duration
-                // of this chunk so its `\n`-as-Boundary branch stays
-                // dormant; the marker-driven `in_paste` flag still
-                // works independently when bracketed paste IS active.
-                let chunk_paste = chunk_looks_like_paste(chunk);
-                if chunk_paste {
-                    state.set_chunk_paste(true);
+                // Paste burst: forward the whole chunk to the child at
+                // once and run harper exactly once afterward, rather than
+                // once per byte. The per-byte path below spell-checks the
+                // entire buffer on every keystroke; for a large paste
+                // that's O(n²) harper passes AND the byte isn't forwarded
+                // until each pass finishes — the multi-second hang in
+                // GH #1. A paste isn't interactive input, so none of the
+                // picker / Tab-fix machinery in `handle_byte` applies.
+                if chunk_looks_like_paste(chunk) {
+                    if !handle_paste_chunk(
+                        chunk,
+                        &mut writer,
+                        &mut state,
+                        &event_tx,
+                        &debug,
+                        &mut picker,
+                    ) {
+                        break;
+                    }
+                    continue;
                 }
                 let mut send_failed = false;
                 for &byte in chunk {
@@ -260,9 +268,6 @@ fn pump_stdin_to_pty(mut writer: Box<dyn Write + Send>, event_tx: mpsc::Sender<R
                     if send_failed {
                         break;
                     }
-                }
-                if chunk_paste {
-                    state.set_chunk_paste(false);
                 }
                 if send_failed {
                     break;
@@ -285,6 +290,65 @@ fn pump_stdin_to_pty(mut writer: Box<dyn Write + Send>, event_tx: mpsc::Sender<R
     }
 }
 
+/// Handle a read chunk classified as a paste burst (see
+/// [`chunk_looks_like_paste`]). Reconstructs the input buffer without
+/// spell-checking each intermediate prefix, forwards the whole chunk to
+/// the child *before* the spell pass so the wrapped app shows
+/// "[Pasted N lines]" without delay, then runs harper exactly once and
+/// emits a single `Lints` snapshot. This is the fix for the multi-second
+/// paste hang (GH #1): per-byte linting is O(n²) harper passes and stalls
+/// byte forwarding until each finishes.
+///
+/// Returns `false` if writing to the PTY failed (the caller should stop
+/// the pump).
+fn handle_paste_chunk(
+    chunk: &[u8],
+    writer: &mut Box<dyn Write + Send>,
+    state: &mut InputState,
+    event_tx: &mpsc::Sender<RenderEvent>,
+    debug: &DebugLog,
+    picker: &mut PickerCtx,
+) -> bool {
+    // `chunk_paste` keeps interior CR/LF as buffer content so a multi-line
+    // paste doesn't Boundary mid-stream on hosts that don't enable
+    // bracketed paste (Claude Code). Marker-driven `in_paste` (for hosts
+    // that do) still toggles independently as the buffer sees `\x1b[200~`
+    // / `\x1b[201~` inside this same chunk.
+    state.set_chunk_paste(true);
+    state.feed_bytes_deferred(chunk);
+    state.set_chunk_paste(false);
+    // Get the bytes to the child first — the spell pass comes after.
+    if writer.write_all(chunk).is_err() {
+        return false;
+    }
+    if writer.flush().is_err() {
+        return false;
+    }
+    // One harper pass over the final buffer, then a single Lints event.
+    // The painter anchors off `buffer_text` + the screen grid, so a lone
+    // snapshot is all it needs (the per-byte `UserChar` events the normal
+    // path emits only feed the non-load-bearing legacy pairing + the
+    // paint throttle, neither of which matters for a paste).
+    state.refresh();
+    let buffer_text = state.buffer().text().to_string();
+    let buffer_chars = buffer_text.chars().count();
+    let buffer_cursor = char_cursor_in(&buffer_text, state.buffer().cursor());
+    // Mirror the grow/shrink tracker the per-byte path maintains, so a Tab
+    // right after a paste evaluates the picker gate against the right
+    // buffer length.
+    picker.note_buffer(buffer_chars);
+    let _ = event_tx.send(RenderEvent::Input(InputEvent::Lints {
+        issues: state.issues().to_vec(),
+        buffer_chars,
+        buffer_text,
+        buffer_cursor,
+    }));
+    if debug.enabled() {
+        debug.log_input(state);
+    }
+    true
+}
+
 /// Minimum size for a CR/LF-ended chunk to be classified as a paste
 /// line. A typed Enter alone is 1 byte; a coalesced burst of fast
 /// typing then Enter is rarely above 10. Pasted prose lines run dozens
@@ -292,6 +356,16 @@ fn pump_stdin_to_pty(mut writer: Box<dyn Write + Send>, event_tx: mpsc::Sender<R
 /// roomy enough to never catch typing yet catches even the shortest
 /// realistic paste line.
 const MIN_PASTE_CHUNK_SIZE: usize = 16;
+
+/// A read chunk at least this large is treated as a paste even with no
+/// CR/LF anywhere in it — i.e. a single long line pasted in one go (a
+/// paragraph with no hard breaks). Comfortably above any escape sequence
+/// (an SGR mouse report is ~12 bytes; the longest CSI we'd ever see is
+/// well under 32) and above any realistic single-`read()` typing burst in
+/// raw mode, where each keypress wakes the reader. A false positive is
+/// harmless: it only batches the spell pass for that chunk, alters no
+/// bytes, and — having no newline — can't mis-handle a boundary.
+const MIN_PASTE_NOLINE_SIZE: usize = 64;
 
 /// Decide whether a single stdin read chunk represents a paste.
 ///
@@ -317,6 +391,10 @@ const MIN_PASTE_CHUNK_SIZE: usize = 16;
 ///    every pasted line would individually look like "user typed
 ///    some content then pressed Enter" to signal #1, and each `\n`
 ///    would boundary the buffer.
+/// 3. **Any chunk ≥ `MIN_PASTE_NOLINE_SIZE` (64) bytes**, even with no
+///    CR/LF at all. Catches a long single-line paste (a paragraph with
+///    no hard breaks). Typing and escape sequences never reach this
+///    size in one read; a false positive only batches the spell pass.
 ///
 /// False-positive analysis:
 /// - `"hello\r"` (typed "hello" + Enter, coalesced): trim leaves
@@ -344,6 +422,11 @@ fn chunk_looks_like_paste(chunk: &[u8]) -> bool {
     }
     // Signal 2: a CR/LF-ended chunk that's too big to be typing.
     if trailing > 0 && chunk.len() >= MIN_PASTE_CHUNK_SIZE {
+        return true;
+    }
+    // Signal 3: a chunk large enough that no keystroke / escape sequence
+    // could have produced it, even with no newline at all.
+    if chunk.len() >= MIN_PASTE_NOLINE_SIZE {
         return true;
     }
     false
@@ -970,5 +1053,27 @@ mod chunk_paste_tests {
         assert!(!chunk_looks_like_paste(b"hi there\r"));    // 9 bytes
         assert!(!chunk_looks_like_paste(b"go on\r\n"));     // 7 bytes
         assert!(!chunk_looks_like_paste(b"abcdefghijklmn\r")); // 15 bytes
+    }
+
+    #[test]
+    fn long_single_line_paste_with_no_newline_is_paste() {
+        // Signal 3: a long single-line paste (a paragraph with no hard
+        // breaks) arrives in one read with no CR/LF at all. Signals 1
+        // and 2 both miss it; the size threshold catches it so the spell
+        // pass is batched instead of run per byte (GH #1).
+        let line = b"the quick brown fox jumps over the lazy dog and then keeps running";
+        assert!(line.len() >= super::MIN_PASTE_NOLINE_SIZE);
+        assert!(chunk_looks_like_paste(line));
+    }
+
+    #[test]
+    fn moderate_no_newline_chunk_is_not_paste() {
+        // Below the no-newline threshold, a chunk without any CR/LF is
+        // still treated as typing — escape sequences and short bursts
+        // must not be misclassified.
+        assert!(!chunk_looks_like_paste(b"hello world")); // 11 bytes
+        assert!(!chunk_looks_like_paste(b"\x1b[A"));       // arrow key
+        let mouse = b"\x1b[<35;120;30M"; // SGR mouse report, ~13 bytes
+        assert!(!chunk_looks_like_paste(mouse));
     }
 }

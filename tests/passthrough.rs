@@ -314,6 +314,62 @@ fn tab_replaces_most_recent_misspelling() {
     );
 }
 
+/// End-to-end paste test (regression for GH #1: paste hang). Writes a
+/// multi-line block as a single chunk into a wrapped `cat`, then asserts
+/// every pasted line round-trips back through the child. The fast paste
+/// path in `pty::handle_paste_chunk` forwards the whole chunk before
+/// running harper, so the content must arrive intact and unmangled — no
+/// mid-paste boundary swallowing newlines, no dropped bytes.
+#[test]
+fn multiline_paste_round_trips_through_child() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tuipo"))
+        .args(["--", "cat"])
+        .env("XDG_CONFIG_HOME", isolated_config_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tuipo");
+
+    // A multi-line block with a couple of misspellings. The interior
+    // newlines make this paste-shaped (signal 1), so it routes through
+    // the fast paste path rather than the per-byte typing path.
+    let lines = [
+        "the quick brown fox jumps over the lazy dog",
+        "i beleive this paragrah has a few typos in it",
+        "pasting should not hang the wrapped program at all",
+        "and every single line must reach the child intact",
+    ];
+    let block = format!("{}\n", lines.join("\n"));
+
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = thread::spawn(move || {
+        // Let harper finish loading on the pump thread; the buffered
+        // block is then read as one chunk once the pump starts reading.
+        thread::sleep(Duration::from_secs(3));
+        stdin.write_all(block.as_bytes()).unwrap();
+        stdin.flush().unwrap();
+        thread::sleep(Duration::from_millis(500));
+        drop(stdin);
+    });
+
+    let output = child.wait_with_output().expect("wait_with_output");
+    writer.join().unwrap();
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    for line in lines {
+        assert!(
+            raw.contains(line),
+            "pasted line missing from child output: {line:?}\n--- stdout ---\n{raw:?}",
+        );
+    }
+}
+
 #[test]
 fn many_small_writes_are_all_delivered() {
     let script = "for i in $(seq 1 50); do printf 'line-%02d\\n' \"$i\"; done";

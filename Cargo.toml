@@ -1,6 +1,6 @@
 [package]
 name = "tuipo"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Grammarly-style spell-check for your terminal — underlines typos as you type in any TUI"
 license = "MIT OR Apache-2.0"

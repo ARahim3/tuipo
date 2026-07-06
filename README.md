@@ -59,9 +59,11 @@ A few things I cared about while building it:
 ```bash
 # Homebrew (macOS & Linux)
 brew install ARahim3/tuipo/tuipo
+# If Homebrew refuses the tap ("untrusted tap"), trust it once:
+#   brew trust ARahim3/tuipo
 
-# or with cargo
-cargo install tuipo
+# or with cargo (--locked builds against the tested dependency versions)
+cargo install tuipo --locked
 
 # or the shell installer (URL is in each release's notes)
 curl --proto '=https' --tlsv1.2 -LsSf \

@@ -1,6 +1,6 @@
 [package]
 name = "tuipo"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Grammarly-style spell-check for your terminal — underlines typos as you type in any TUI"
 license = "MIT OR Apache-2.0"
@@ -20,7 +20,12 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
-harper-core = "2"
+# Pinned exactly: harper-core 2.5.0 fails to compile on current stable
+# rustc (an upstream type-inference breakage), and a loose `"2"` lets
+# `cargo install tuipo` resolve to it. 2.0.0 is the version every release
+# has shipped and the test suite + grammar slice were tuned against.
+# Revisit when upstream ships a fixed 2.5.x.
+harper-core = "=2.0.0"
 portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
 signal-hook = "0.3"

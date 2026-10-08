@@ -72,11 +72,14 @@ impl CustomDict {
         }
     }
 
+    /// Case-insensitive; a listed word's possessive (`claude's`) counts.
     pub fn contains(&self, word: &str) -> bool {
         if self.words.is_empty() {
             return false;
         }
-        self.words.contains(&word.to_lowercase())
+        let lower = word.to_lowercase();
+        self.words.contains(&lower)
+            || strip_possessive(&lower).is_some_and(|base| self.words.contains(base))
     }
 
     #[allow(dead_code)]
@@ -88,6 +91,14 @@ impl CustomDict {
     pub fn is_empty(&self) -> bool {
         self.words.is_empty()
     }
+}
+
+/// `word` without a trailing possessive `'s` / `’s`, if it has one.
+pub fn strip_possessive(word: &str) -> Option<&str> {
+    ["'s", "\u{2019}s", "'S", "\u{2019}S"]
+        .iter()
+        .find_map(|suffix| word.strip_suffix(suffix))
+        .filter(|base| !base.is_empty())
 }
 
 fn default_path() -> Option<PathBuf> {
@@ -170,6 +181,17 @@ mod tests {
         for w in ["apple", "banana", "cherry"] {
             assert!(d.contains(w), "missing `{w}`");
         }
+    }
+
+    #[test]
+    fn possessive_of_a_listed_word_counts() {
+        let d = CustomDict::from_text("claude\ntuipo\n");
+        assert!(d.contains("claude's"));
+        assert!(d.contains("Claude\u{2019}s"));
+        assert!(!d.contains("teh's"));
+        assert_eq!(strip_possessive("PTY's"), Some("PTY"));
+        assert_eq!(strip_possessive("'s"), None);
+        assert_eq!(strip_possessive("its"), None);
     }
 
     #[test]

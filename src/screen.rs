@@ -226,19 +226,15 @@ impl Perform for StatePerformer<'_> {
                 self.state.pending_wrap = false;
                 self.state.bump_version();
             }
-            0x0A..=0x0C => {
-                if self.state.cursor.row + 1 < self.state.rows {
-                    self.state.cursor.row += 1;
-                    self.state.pending_wrap = false;
-                    self.state.bump_version();
-                }
+            0x0A..=0x0C if self.state.cursor.row + 1 < self.state.rows => {
+                self.state.cursor.row += 1;
+                self.state.pending_wrap = false;
+                self.state.bump_version();
             }
-            0x0D => {
-                if self.state.cursor.col != 0 || self.state.pending_wrap {
-                    self.state.cursor.col = 0;
-                    self.state.pending_wrap = false;
-                    self.state.bump_version();
-                }
+            0x0D if self.state.cursor.col != 0 || self.state.pending_wrap => {
+                self.state.cursor.col = 0;
+                self.state.pending_wrap = false;
+                self.state.bump_version();
             }
             _ => {}
         }

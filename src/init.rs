@@ -6,8 +6,14 @@
 //! adding a parent. After install, every new terminal calls
 //! `exec tuipo -- $SHELL` once during shell init, then the user is
 //! inside a tuipo-wrapped shell for the rest of the session.
+//!
+//! `tuipo off` / `tuipo on` flip the off switch (`config::off_switch_path`)
+//! instead of touching the hook: while it's off, `tuipo -- $SHELL` simply
+//! runs the shell (see `main`), so any installed hook — old ones included —
+//! starts plain shells, and running sessions pause themselves.
 
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 const MARKER: &str = "# tuipo — Grammarly-style spell-check for terminal TUIs";
 
@@ -86,6 +92,77 @@ pub fn run_init(args: &[String]) -> i32 {
         hook.rc_path.display(),
     );
     0
+}
+
+/// `tuipo off`: switch tuipo off until `tuipo on`.
+pub fn run_off() -> i32 {
+    let Some(path) = crate::config::off_switch_path() else {
+        eprintln!("tuipo off: neither $XDG_CONFIG_HOME nor $HOME is set");
+        return 1;
+    };
+    match switch_off(&path) {
+        Ok(true) => {
+            println!(
+                "tuipo is off: open tabs stop underlining within a second, and new tabs start without it.\n\
+                 Run `tuipo on` to turn it back on."
+            );
+            0
+        }
+        Ok(false) => {
+            println!("tuipo is already off. Run `tuipo on` to turn it back on.");
+            0
+        }
+        Err(e) => {
+            eprintln!("tuipo off: couldn't create {}: {e}", path.display());
+            1
+        }
+    }
+}
+
+/// `tuipo on`: undo `tuipo off`.
+pub fn run_on() -> i32 {
+    let Some(path) = crate::config::off_switch_path() else {
+        eprintln!("tuipo on: neither $XDG_CONFIG_HOME nor $HOME is set");
+        return 1;
+    };
+    match switch_on(&path) {
+        Ok(true) => {
+            println!(
+                "tuipo is on: open tabs pick it back up within a second, and new tabs start with it.\n\
+                 (Tabs opened while it was off stay plain until you open new ones.)"
+            );
+            0
+        }
+        Ok(false) => {
+            println!("tuipo is already on.");
+            0
+        }
+        Err(e) => {
+            eprintln!("tuipo on: couldn't remove {}: {e}", path.display());
+            1
+        }
+    }
+}
+
+/// Create the off switch. `Ok(true)` if tuipo was on.
+fn switch_off(path: &Path) -> io::Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, "tuipo is switched off while this file exists; `tuipo on` removes it.\n")?;
+    Ok(true)
+}
+
+/// Remove the off switch. `Ok(true)` if tuipo was off.
+fn switch_on(path: &Path) -> io::Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Remove any prior tuipo hook lines and their MARKER comments from rc
@@ -278,5 +355,23 @@ alias ll='ls -l'
 export FOO=bar
 ";
         assert_eq!(strip_old_hook(rc), rc.trim_end());
+    }
+
+    #[test]
+    fn off_and_on_flip_the_switch_file_and_are_idempotent() {
+        let dir = std::env::temp_dir().join(format!("tuipo-switch-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // The config dir may not exist yet; `off` creates it.
+        let path = dir.join("tuipo").join("off");
+
+        assert!(switch_off(&path).unwrap(), "first off should switch");
+        assert!(path.exists());
+        assert!(!switch_off(&path).unwrap(), "second off is a no-op");
+
+        assert!(switch_on(&path).unwrap(), "first on should switch");
+        assert!(!path.exists());
+        assert!(!switch_on(&path).unwrap(), "second on is a no-op");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

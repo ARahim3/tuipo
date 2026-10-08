@@ -198,7 +198,7 @@ mod tests {
     use crate::input::InputState;
 
     fn make_state(input: &[u8]) -> InputState {
-        let mut s = InputState::new();
+        let mut s = InputState::with_checker();
         let out = s.feed_bytes(input);
         // Ensure feeding worked
         let _ = out;
@@ -245,7 +245,7 @@ mod tests {
         // right-moves (to land cursor at char_end=9), 3 backspaces (to
         // delete "teh"), and replacement = just the suggestion (no
         // trailing-text retype — the trailing text is left untouched).
-        let mut s = InputState::new();
+        let mut s = InputState::with_checker();
         s.feed_bytes(b"write teh paragprah for the");
         // Park the cursor at char 7 (inside "teh"). Buffer is ASCII so
         // char offset == byte offset.
@@ -276,7 +276,7 @@ mod tests {
     /// would expect.
     #[test]
     fn mid_buffer_fix_preserves_surrounding_text() {
-        let mut s = InputState::new();
+        let mut s = InputState::with_checker();
         s.feed_bytes(b"write teh paragprah for the");
         // Move the cursor back from position 27 to position 9 (just after
         // "teh") by sending 18 left-arrow CSIs.
@@ -316,7 +316,7 @@ mod tests {
         // Cursor is just past the misspelling but not at end-of-buffer
         // (e.g. user typed "teh world" and moved cursor back to between
         // the space and 'w'). Expect left_moves to align to char_end.
-        let mut s = InputState::new();
+        let mut s = InputState::with_checker();
         s.feed_bytes(b"teh world");
         // Cursor at end (9). Move left until cursor=4 (just after space,
         // before 'w'). For `teh` at 0..3, char_end=3, so left_moves=1.
@@ -379,7 +379,7 @@ mod tests {
         // Smoke test that the buffer + state interaction works; not really
         // about fix logic, just ensures `FeedOutcome` is imported and the
         // construction path is exercised.
-        let mut s = InputState::new();
+        let mut s = InputState::with_checker();
         let out = s.feed_bytes(b"x");
         assert!(matches!(out, FeedOutcome::Updated | FeedOutcome::NoChange));
     }
@@ -392,7 +392,7 @@ mod tests {
         // a boundary outside paste mode and would corrupt the buffer.
         // Use the bracketed-paste machinery to put the `\n` in the
         // buffer through the same code path real pastes use.
-        let mut s = InputState::new();
+        let mut s = InputState::with_checker();
         s.feed_bytes(&[0x1B, b'[', b'2', b'0', b'0', b'~']);
         s.feed_bytes(b"teh fix\nfix more");
         s.feed_bytes(&[0x1B, b'[', b'2', b'0', b'1', b'~']);
@@ -410,6 +410,7 @@ mod tests {
             suggestions: vec!["the".into()],
             category: crate::spell::IssueCategory::Spelling,
             priority: 50,
+            rule: "SpellCheck".into(),
         };
         assert!(
             build_fix(&s, &issue, "the").is_none(),
@@ -420,7 +421,7 @@ mod tests {
     #[test]
     fn build_fix_accepts_last_line_lint_in_multi_line_buffer() {
         // Counterpart to the previous test: line-2 "teh" IS fixable.
-        let mut s = InputState::new();
+        let mut s = InputState::with_checker();
         s.feed_bytes(&[0x1B, b'[', b'2', b'0', b'0', b'~']);
         s.feed_bytes(b"fix me\nfix teh more");
         s.feed_bytes(&[0x1B, b'[', b'2', b'0', b'1', b'~']);
@@ -436,6 +437,7 @@ mod tests {
             suggestions: vec!["the".into()],
             category: crate::spell::IssueCategory::Spelling,
             priority: 50,
+            rule: "SpellCheck".into(),
         };
         let fix = build_fix(&s, &issue, "the").expect("last-line lint should be fixable");
         // End-of-buffer regime: trailing = " more" (after char_end).

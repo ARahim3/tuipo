@@ -31,6 +31,64 @@ fn isolated_config_dir() -> std::path::PathBuf {
     dir
 }
 
+/// Debug-build harper takes a few seconds to load; release takes ~0.2 s.
+const ENGINE_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How many times `needle` appears in the debug log at `path`.
+fn log_count(path: &std::path::Path, needle: &str) -> usize {
+    std::fs::read_to_string(path)
+        .map(|log| log.matches(needle).count())
+        .unwrap_or(0)
+}
+
+/// Block until the debug log at `path` holds at least `n` copies of
+/// `needle`. The spell engine starts on the first keystroke, so tests
+/// type one character, wait for `ready pid=`, then type the rest.
+fn wait_for_log(path: &std::path::Path, needle: &str, n: usize, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if log_count(path, needle) >= n {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// The pid from the most recent `ready pid=<n>` engine line.
+fn last_engine_pid(path: &std::path::Path) -> Option<u32> {
+    let log = std::fs::read_to_string(path).ok()?;
+    let (_, rest) = log.rsplit_once("ready pid=")?;
+    rest.split_whitespace().next()?.parse().ok()
+}
+
+/// A config dir of its own, for tests that flip `tuipo off`: the shared
+/// `isolated_config_dir` must never be switched off under other tests.
+fn fresh_config_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("tuipo-test-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn tuipo_switch(config_dir: &std::path::Path, which: &str) -> String {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_tuipo"))
+        .arg(which)
+        .env("XDG_CONFIG_HOME", config_dir)
+        .output()
+        .expect("run tuipo on/off");
+    assert!(out.status.success(), "tuipo {which} failed: {out:?}");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn type_slowly(stdin: &mut impl std::io::Write, text: &str) {
+    for c in text.chars() {
+        write!(stdin, "{c}").unwrap();
+        stdin.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
 #[test]
 fn child_stdout_reaches_us() {
     let assert = tuipo().args(["--", "echo", "hello-tuipo"]).assert();
@@ -154,7 +212,6 @@ fn multibyte_output_passes_through_unchanged() {
 /// sequence wrapping the expected misspelling.
 #[test]
 fn paint_emits_underline_ansi_after_pause() {
-    use std::io::Write;
     use std::process::{Command, Stdio};
     use std::thread;
     use std::time::Duration;
@@ -167,6 +224,9 @@ fn paint_emits_underline_ansi_after_pause() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_tuipo"))
         .args(["--", "cat"])
         .env("TUIPO_DEBUG_LOG", &log_path)
+        // Hermetic: a real `tuipo off` (or config) on the dev machine must
+        // not change what this test sees.
+        .env("XDG_CONFIG_HOME", isolated_config_dir())
         // Pin the underline style to PLAIN regardless of the test runner's
         // terminal — the SGR assertions below check the exact byte
         // sequence and would flake if TERM_PROGRAM-detection switched us
@@ -179,17 +239,19 @@ fn paint_emits_underline_ansi_after_pause() {
         .expect("spawn tuipo");
 
     let mut stdin = child.stdin.take().unwrap();
+    let ready_log = log_path.clone();
     let writer = thread::spawn(move || {
-        thread::sleep(Duration::from_secs(3));
+        // The first keystroke starts the spell engine; let it load.
+        type_slowly(&mut stdin, "w");
+        assert!(
+            wait_for_log(&ready_log, "ready pid=", 1, ENGINE_READY_TIMEOUT),
+            "spell engine never became ready"
+        );
         // Trailing space matters: the painter skips the word being typed
         // (lint touching cursor) to avoid stale-paint cells when partial
         // words flip in and out of the lint set. The space ensures `teh`
         // is a completed word by the time the pause hits.
-        for c in "write teh paragprah ".chars() {
-            write!(stdin, "{c}").unwrap();
-            stdin.flush().unwrap();
-            thread::sleep(Duration::from_millis(30));
-        }
+        type_slowly(&mut stdin, "rite teh paragprah ");
         thread::sleep(Duration::from_millis(500));
         drop(stdin);
     });
@@ -268,16 +330,17 @@ fn tab_replaces_most_recent_misspelling() {
         .expect("spawn tuipo");
 
     let mut stdin = child.stdin.take().unwrap();
+    let ready_log = log_path.clone();
     let writer = thread::spawn(move || {
-        // Wait for harper to load.
-        thread::sleep(Duration::from_secs(3));
-        for c in "teh".chars() {
-            write!(stdin, "{c}").unwrap();
-            stdin.flush().unwrap();
-            thread::sleep(Duration::from_millis(30));
-        }
-        // Let harper produce the lint for 'teh' (Lints event needs to reach
-        // matcher before we hit Tab — small extra pause).
+        type_slowly(&mut stdin, "teh");
+        // The first keystroke started the spell engine; once it's ready
+        // it lints the buffer it was waiting on. (Tab-fix itself waits up
+        // to a second for lints matching the live buffer — enough for a
+        // release-build cold start, not a debug one.)
+        assert!(
+            wait_for_log(&ready_log, "ready pid=", 1, ENGINE_READY_TIMEOUT),
+            "spell engine never became ready"
+        );
         thread::sleep(Duration::from_millis(100));
         // Press Tab.
         stdin.write_all(b"\t").unwrap();
@@ -349,9 +412,8 @@ fn multiline_paste_round_trips_through_child() {
 
     let mut stdin = child.stdin.take().unwrap();
     let writer = thread::spawn(move || {
-        // Let harper finish loading on the pump thread; the buffered
-        // block is then read as one chunk once the pump starts reading.
-        thread::sleep(Duration::from_secs(3));
+        // Let the pump start reading so the block arrives as one chunk.
+        thread::sleep(Duration::from_millis(500));
         stdin.write_all(block.as_bytes()).unwrap();
         stdin.flush().unwrap();
         thread::sleep(Duration::from_millis(500));
@@ -379,4 +441,272 @@ fn many_small_writes_are_all_delivered() {
         let needle = format!("line-{i:02}");
         assert!(stdout.contains(&needle), "missing {needle}: full stdout was {stdout:?}");
     }
+}
+
+/// An idle terminal never loads harper: the spell engine starts on the
+/// first keystroke, not when tuipo does.
+#[test]
+fn engine_is_not_started_without_typing() {
+    let log_path =
+        std::env::temp_dir().join(format!("tuipo-noinput-test-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&log_path);
+    tuipo()
+        .args(["--", "sh", "-c", "sleep 1"])
+        .env("TUIPO_DEBUG_LOG", &log_path)
+        .assert()
+        .success();
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&log_path);
+    assert!(log.contains("BOOT"), "debug log was not written:\n{log}");
+    assert!(!log.contains("spawn pid="), "engine started with no input:\n{log}");
+}
+
+/// The memory win: harper lives in a `tuipo __engine` child that exits
+/// once typing stops for `TUIPO_ENGINE_IDLE_SECS`. Typing again brings it
+/// back, and the respawned engine's lints still get painted.
+#[test]
+fn idle_engine_exits_and_respawns_on_next_keystroke() {
+    use std::process::{Command, Stdio};
+    use std::thread;
+
+    let log_path = std::env::temp_dir().join(format!("tuipo-idle-test-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&log_path);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tuipo"))
+        .args(["--", "cat"])
+        .env("TUIPO_DEBUG_LOG", &log_path)
+        .env("TUIPO_PLAIN_UNDERLINE", "1")
+        .env("TUIPO_ENGINE_IDLE_SECS", "1")
+        .env("XDG_CONFIG_HOME", isolated_config_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tuipo");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let log = log_path.clone();
+    let writer = thread::spawn(move || {
+        type_slowly(&mut stdin, "teh ");
+        assert!(
+            wait_for_log(&log, "ready pid=", 1, ENGINE_READY_TIMEOUT),
+            "first engine never became ready"
+        );
+        assert!(
+            wait_for_log(&log, "stop reason=idle", 1, Duration::from_secs(15)),
+            "idle engine was not stopped"
+        );
+        type_slowly(&mut stdin, "paragprah ");
+        assert!(
+            wait_for_log(&log, "ready pid=", 2, ENGINE_READY_TIMEOUT),
+            "engine did not come back after the idle stop"
+        );
+        thread::sleep(Duration::from_millis(700));
+        drop(stdin);
+    });
+
+    let output = child.wait_with_output().expect("wait_with_output");
+    let typed = writer.join();
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&log_path);
+    let raw = String::from_utf8_lossy(&output.stdout);
+    assert!(typed.is_ok(), "typing script failed\n--- log ---\n{log}");
+    assert!(
+        raw.contains("\x1b[4mparagprah\x1b[24m"),
+        "respawned engine's lint was not painted\n--- stdout ---\n{raw:?}\n--- log ---\n{log}",
+    );
+}
+
+/// A dead engine costs a moment of lints, never the session: tuipo
+/// notices, starts a new one on the next keystroke, and keeps painting.
+#[test]
+fn killed_engine_is_replaced() {
+    use std::process::{Command, Stdio};
+    use std::thread;
+
+    let log_path = std::env::temp_dir().join(format!("tuipo-kill-test-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&log_path);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tuipo"))
+        .args(["--", "cat"])
+        .env("TUIPO_DEBUG_LOG", &log_path)
+        .env("TUIPO_PLAIN_UNDERLINE", "1")
+        .env("XDG_CONFIG_HOME", isolated_config_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tuipo");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let log = log_path.clone();
+    let writer = thread::spawn(move || {
+        type_slowly(&mut stdin, "teh ");
+        assert!(
+            wait_for_log(&log, "ready pid=", 1, ENGINE_READY_TIMEOUT),
+            "engine never became ready"
+        );
+        let pid = last_engine_pid(&log).expect("engine pid in debug log");
+        let killed = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        assert!(killed.is_ok_and(|s| s.success()), "could not kill engine {pid}");
+        assert!(
+            wait_for_log(&log, "exited unexpectedly", 1, Duration::from_secs(10)),
+            "engine death went unnoticed"
+        );
+        type_slowly(&mut stdin, "paragprah ");
+        assert!(
+            wait_for_log(&log, "ready pid=", 2, ENGINE_READY_TIMEOUT),
+            "no replacement engine"
+        );
+        thread::sleep(Duration::from_millis(700));
+        drop(stdin);
+    });
+
+    let output = child.wait_with_output().expect("wait_with_output");
+    let typed = writer.join();
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&log_path);
+    let raw = String::from_utf8_lossy(&output.stdout);
+    assert!(typed.is_ok(), "typing script failed\n--- log ---\n{log}");
+    assert!(
+        raw.contains("\x1b[4mparagprah\x1b[24m"),
+        "replacement engine's lint was not painted\n--- stdout ---\n{raw:?}\n--- log ---\n{log}",
+    );
+}
+
+/// `tuipo __engine` speaks the length-prefixed protocol on stdin/stdout:
+/// a hello frame once harper is warm, one response per request, and a
+/// clean exit when its stdin closes.
+#[test]
+fn engine_subcommand_speaks_the_wire_protocol() {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    let mut engine = Command::new(env!("CARGO_BIN_EXE_tuipo"))
+        .arg("__engine")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn engine");
+    let mut stdin = engine.stdin.take().unwrap();
+    let mut stdout = engine.stdout.take().unwrap();
+
+    let read_frame = |r: &mut dyn Read| -> Vec<u8> {
+        let mut len = [0u8; 4];
+        r.read_exact(&mut len).unwrap();
+        let mut payload = vec![0u8; u32::from_le_bytes(len) as usize];
+        r.read_exact(&mut payload).unwrap();
+        payload
+    };
+
+    let hello = read_frame(&mut stdout);
+    assert!(hello.starts_with(b"TUIPO-ENGINE"), "bad hello: {hello:?}");
+
+    let mut request = 7u64.to_le_bytes().to_vec();
+    request.extend_from_slice(b"fix teh bug");
+    stdin.write_all(&(request.len() as u32).to_le_bytes()).unwrap();
+    stdin.write_all(&request).unwrap();
+    stdin.flush().unwrap();
+
+    let response = read_frame(&mut stdout);
+    assert_eq!(response[..8], 7u64.to_le_bytes(), "response id");
+    let count = u32::from_le_bytes(response[8..12].try_into().unwrap());
+    assert!(count >= 1, "no issues reported for `fix teh bug`");
+    assert!(
+        response.windows(3).any(|w| w == b"teh"),
+        "response doesn't mention `teh`"
+    );
+
+    drop(stdin);
+    let status = engine.wait().unwrap();
+    assert!(status.success(), "engine exited with {status}");
+}
+
+/// `tuipo off` makes `tuipo -- <cmd>` run the command directly — no PTY in
+/// between, so a new tab's shell starts plain — and `tuipo on` undoes it.
+#[test]
+fn off_switch_runs_commands_unwrapped() {
+    let config = fresh_config_dir("offexec");
+    let probe = ["--", "sh", "-c", "[ -t 0 ] && echo wrapped || echo direct; echo active=$TUIPO_ACTIVE"];
+    let run = || {
+        let out = tuipo()
+            .args(probe)
+            .env("XDG_CONFIG_HOME", &config)
+            .assert()
+            .success();
+        String::from_utf8_lossy(&out.get_output().stdout).into_owned()
+    };
+
+    assert!(run().contains("wrapped"), "on by default");
+    assert!(tuipo_switch(&config, "off").contains("tuipo is off"));
+    assert!(tuipo_switch(&config, "off").contains("already off"));
+    let off = run();
+    assert!(off.contains("direct"), "switched off but still wrapped: {off:?}");
+    // The hook's re-entrance guard must hold, or a shell's rc file would
+    // exec tuipo again in a loop.
+    assert!(off.contains("active=1"), "{off:?}");
+
+    assert!(tuipo_switch(&config, "on").contains("tuipo is on"));
+    assert!(run().contains("wrapped"), "switched on but not wrapped");
+    let _ = std::fs::remove_dir_all(&config);
+}
+
+/// A running session notices `tuipo off` on its own: it clears what it
+/// underlined, stops linting and stops its engine; `tuipo on` brings it
+/// all back.
+#[test]
+fn off_switch_pauses_and_resumes_running_sessions() {
+    use std::process::{Command, Stdio};
+    use std::thread;
+
+    let config = fresh_config_dir("offlive");
+    let log_path = std::env::temp_dir().join(format!("tuipo-offlive-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&log_path);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tuipo"))
+        .args(["--", "cat"])
+        .env("TUIPO_DEBUG_LOG", &log_path)
+        .env("TUIPO_PLAIN_UNDERLINE", "1")
+        .env("XDG_CONFIG_HOME", &config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tuipo");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let (log, cfg) = (log_path.clone(), config.clone());
+    let writer = thread::spawn(move || {
+        type_slowly(&mut stdin, "teh ");
+        assert!(wait_for_log(&log, "ready pid=", 1, ENGINE_READY_TIMEOUT), "engine never ready");
+        thread::sleep(Duration::from_millis(500));
+
+        tuipo_switch(&cfg, "off");
+        assert!(wait_for_log(&log, "SWITCH   off", 1, Duration::from_secs(5)), "off not noticed");
+        assert!(wait_for_log(&log, "stop reason=off", 1, Duration::from_secs(5)), "engine kept running");
+        type_slowly(&mut stdin, "wrold ");
+        thread::sleep(Duration::from_millis(700));
+        type_slowly(&mut stdin, "\n");
+
+        tuipo_switch(&cfg, "on");
+        assert!(wait_for_log(&log, "SWITCH   on", 1, Duration::from_secs(5)), "on not noticed");
+        type_slowly(&mut stdin, "abuot ");
+        assert!(wait_for_log(&log, "ready pid=", 2, ENGINE_READY_TIMEOUT), "engine not back");
+        thread::sleep(Duration::from_millis(700));
+        drop(stdin);
+    });
+
+    let output = child.wait_with_output().expect("wait_with_output");
+    let typed = writer.join();
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&log_path);
+    let _ = std::fs::remove_dir_all(&config);
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let ctx = || format!("\n--- stdout ---\n{raw:?}\n--- log ---\n{log}");
+    assert!(typed.is_ok(), "typing script failed{}", ctx());
+    assert!(raw.contains("\x1b[4mteh\x1b[24m"), "nothing painted before off{}", ctx());
+    assert!(raw.contains("\x1b[24mteh"), "underline not cleared on off{}", ctx());
+    assert!(!raw.contains("\x1b[4mwrold"), "painted while off{}", ctx());
+    assert!(raw.contains("\x1b[4mabuot\x1b[24m"), "not painting after on{}", ctx());
 }

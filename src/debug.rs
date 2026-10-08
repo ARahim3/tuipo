@@ -62,17 +62,35 @@ impl DebugLog {
         self.file.is_some()
     }
 
+    /// Buffer after a keystroke. Lints arrive separately, from the lint
+    /// worker (`LINTS` lines).
     pub fn log_input(&self, state: &InputState) {
         if !self.enabled() {
             return;
         }
-        let text = state.buffer().text();
-        let issues = state.issues();
-        let payload = format!(
-            "buf={text:?} issues={}",
-            format_issues(issues),
-        );
-        self.line("INPUT", &payload);
+        self.line("INPUT", &format!("buf={:?}", state.buffer().text()));
+    }
+
+    /// A lint snapshot the worker published to the render loop.
+    pub fn log_lints(&self, text: &str, issues: &[SpellIssue]) {
+        if !self.enabled() {
+            return;
+        }
+        let payload = format!("buf={text:?} issues={}", format_issues(issues));
+        self.line("LINTS", &payload);
+    }
+
+    /// Spell-engine lifecycle: spawn / ready / stop / failures / fallback.
+    pub fn log_engine(&self, args: std::fmt::Arguments<'_>) {
+        if !self.enabled() {
+            return;
+        }
+        self.line("ENGINE", &args.to_string());
+    }
+
+    /// `tuipo off` / `tuipo on` noticed by a running session.
+    pub fn log_switch(&self, on: bool) {
+        self.line("SWITCH", if on { "on" } else { "off" });
     }
 
     pub fn log_boundary(&self) {
@@ -162,8 +180,8 @@ fn format_issues(issues: &[SpellIssue]) -> String {
         }
         let top_suggestion = issue.suggestions.first().map(String::as_str).unwrap_or("-");
         s.push_str(&format!(
-            "{}@{}..{}→{:?}",
-            issue.word, issue.byte_start, issue.byte_end, top_suggestion
+            "{}@{}..{}→{:?}({})",
+            issue.word, issue.byte_start, issue.byte_end, top_suggestion, issue.rule
         ));
     }
     s.push(']');

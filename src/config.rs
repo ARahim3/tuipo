@@ -249,17 +249,30 @@ pub fn get() -> &'static Config {
 /// if set, else `~/.config/tuipo/config.toml`. Returns None only when
 /// neither `XDG_CONFIG_HOME` nor `HOME` is set, which is rare enough to
 /// be a "give up gracefully" case.
-pub fn default_config_path() -> Option<PathBuf> {
+/// tuipo's config directory: `$XDG_CONFIG_HOME/tuipo`, else
+/// `~/.config/tuipo`. Holds `config.toml`, `dict.txt` and the off switch.
+pub fn config_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(xdg).join("tuipo").join("config.toml"));
+        return Some(PathBuf::from(xdg).join("tuipo"));
     }
     let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join(".config")
-            .join("tuipo")
-            .join("config.toml"),
-    )
+    Some(PathBuf::from(home).join(".config").join("tuipo"))
+}
+
+pub fn default_config_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("config.toml"))
+}
+
+/// While this file exists tuipo is switched off (`tuipo off` creates it,
+/// `tuipo on` removes it): `tuipo -- <cmd>` just runs the command, and
+/// running sessions stop checking and painting within a second.
+pub fn off_switch_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("off"))
+}
+
+/// Whether `tuipo off` is in effect.
+pub fn switched_off() -> bool {
+    off_switch_path().is_some_and(|path| path.exists())
 }
 
 impl Config {

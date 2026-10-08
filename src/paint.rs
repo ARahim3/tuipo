@@ -69,8 +69,9 @@
 //!   "wait until the word is finished" sidesteps that entire class of
 //!   visual residue.
 //!
-//! Multi-row spans (wrapped words) aren't painted — we require the whole
-//! word to fit on the anchor row.
+//! Each lint is painted as runs of non-whitespace chars in consecutive
+//! cells (`paint_runs`): the spaces inside a phrase lint ("the the") are
+//! left alone, and a word or phrase that wraps is painted row by row.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -515,31 +516,61 @@ fn compute_new_spans(
         {
             continue;
         }
-        let (start_row, start_col) = positions[local_start];
-        let (end_row, end_col_last) = positions[local_end - 1];
-        if start_row != end_row {
-            continue;
-        }
-        let row = start_row;
-        let col_end = end_col_last + 1;
-        if row >= screen.rows || col_end > screen.cols {
-            continue;
-        }
-        let first_char = issue.word.chars().next();
-        if let Some(c) = first_char {
-            match matcher.cell_at(row, start_col) {
-                Some(gc) if chars_equiv(gc, c) => {}
-                _ => continue,
-            }
-        }
-        spans.push(NewSpan {
-            row,
-            col_start: start_col,
-            col_end,
-            word: issue.word.clone(),
-        });
+        spans.extend(paint_runs(
+            &issue.word,
+            &positions[local_start..local_end],
+            screen,
+            matcher,
+        ));
     }
     spans
+}
+
+/// Split a lint into the runs the painter underlines: maximal stretches
+/// of non-whitespace chars in consecutive cells of one row. Spaces stay
+/// untouched — hosts often draw them by moving the cursor, so the grid
+/// has no cell to restore them from once the lint goes away — and a
+/// phrase ("the the") or a word that wraps is painted piece by piece.
+/// A run is dropped unless it fits on screen and its first char matches
+/// the grid cell it would cover (sanity check against stale positions).
+fn paint_runs(
+    word: &str,
+    positions: &[(u16, u16)],
+    screen: &ScreenState,
+    matcher: &EchoMatcher,
+) -> Vec<NewSpan> {
+    let mut runs = Vec::new();
+    let mut current: Option<NewSpan> = None;
+    for (ch, &(row, col)) in word.chars().zip(positions) {
+        if ch.is_whitespace() {
+            runs.extend(current.take());
+            continue;
+        }
+        if let Some(run) = current
+            .as_mut()
+            .filter(|run| run.row == row && run.col_end == col)
+        {
+            run.col_end += 1;
+            run.word.push(ch);
+        } else {
+            runs.extend(current.take());
+            current = Some(NewSpan {
+                row,
+                col_start: col,
+                col_end: col + 1,
+                word: ch.to_string(),
+            });
+        }
+    }
+    runs.extend(current);
+    runs.retain(|run| {
+        run.row < screen.rows
+            && run.col_end <= screen.cols
+            && run.word.chars().next().is_some_and(|c| {
+                matches!(matcher.cell_at(run.row, run.col_start), Some(gc) if chars_equiv(gc, c))
+            })
+    });
+    runs
 }
 
 /// Walk the anchor line through the grid from the anchor position,
@@ -695,6 +726,7 @@ mod tests {
             suggestions: vec!["x".into()],
             category: crate::spell::IssueCategory::Spelling,
             priority: 50,
+            rule: "SpellCheck".into(),
         }
     }
 
@@ -1344,18 +1376,53 @@ mod tests {
         );
     }
 
+    /// Replay painter output from `cursor` (relative moves, plain SGR) and
+    /// return every cell written with underline on, as (row, col, char).
+    fn underlined_cells(out: &[u8], cursor: (u16, u16)) -> Vec<(u16, u16, char)> {
+        let text = String::from_utf8_lossy(out);
+        let mut chars = text.chars().peekable();
+        let (mut row, mut col) = (cursor.0 as i32, cursor.1 as i32);
+        let mut underline = false;
+        let mut cells = Vec::new();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' && chars.peek() == Some(&'[') {
+                chars.next();
+                let mut param = String::new();
+                let mut fin = ' ';
+                for n in chars.by_ref() {
+                    if n.is_ascii_alphabetic() {
+                        fin = n;
+                        break;
+                    }
+                    param.push(n);
+                }
+                let n: i32 = param.parse().unwrap_or(1);
+                match fin {
+                    'A' => row -= n,
+                    'B' => row += n,
+                    'C' => col += n,
+                    'D' => col -= n,
+                    'm' => underline = param == "4",
+                    _ => {}
+                }
+            } else {
+                if underline {
+                    cells.push((row as u16, col as u16, c));
+                }
+                col += 1;
+            }
+        }
+        cells
+    }
+
     #[test]
-    fn paint_handles_a_wrapping_earlier_line() {
-        // Earlier buffer line is too long to fit in one screen row at
-        // the anchor column — it wraps. The painter's row math
-        // accounts for this: a wrapping line consumes
-        // `ceil(line_len / line_width)` rows, and the previous line's
-        // first row is computed accordingly. Without wrap-aware row
-        // math, a wrapping earlier line would push everything above
-        // off by one row.
+    fn paint_splits_a_lint_that_wraps_across_rows() {
+        // An earlier buffer line too long for one row wraps, and the
+        // misspelling straddles the wrap. The grid walk records exactly
+        // where each char landed, so the painter underlines both pieces
+        // in place — `t` at the end of row 0, `eh` at the start of row 1.
         //
-        // Screen is 14 cols wide. Anchor col = 0 → line_width = 14.
-        // Buffer:
+        // Screen is 14 cols wide. Buffer:
         //   "abcdefghijkl teh"    = 16 chars (line 0; wraps to 2 rows)
         //   "\n"                  = sep
         //   "trailing"            = 8 chars (line 1; anchor row)
@@ -1363,11 +1430,6 @@ mod tests {
         //   row 0: "abcdefghijkl t"      (first wrap-row of line 0)
         //   row 1: "eh"                  (second wrap-row of line 0)
         //   row 2: "trailing"            (line 1 — anchor)
-        // The "teh" in line 0 sits at chars 13..16, which is local
-        // chars 13..16 within line 0, which lands on wrap-row 0 cols
-        // 13..14 (partial — wraps at col 14, but actually 13..14 is
-        // only one char "t"). The lint spans the wrap boundary so
-        // it must be SKIPPED rather than painted at the wrong place.
         let mut m = EchoMatcher::new();
         m.apply_input(InputEvent::Lints {
             issues: vec![issue(13, 16, "teh")],
@@ -1380,14 +1442,68 @@ mod tests {
         feed_history(&mut m, 1, 0, "eh");
         feed_history(&mut m, 2, 0, "trailing");
         let out = paint_plain(&m, &screen_with_cursor(14, 24, 2, 8));
-        let st = String::from_utf8_lossy(&out);
-        // The cross-wrap "teh" is skipped (would paint at wrong row).
-        // The trailing line has no lints (none defined). So no paint
-        // bytes should be emitted at all.
-        assert!(
-            !st.contains("\x1b[4m"),
-            "cross-wrap lint must not paint: {st:?}"
+        assert_eq!(
+            underlined_cells(&out, (2, 8)),
+            vec![(0, 13, 't'), (1, 0, 'e'), (1, 1, 'h')],
+            "wrapped lint should be underlined piecewise in place: {:?}",
+            String::from_utf8_lossy(&out)
         );
+    }
+
+    #[test]
+    fn phrase_lint_underlines_words_but_not_the_space_between() {
+        // "the the" is one lint, but only its letters get the underline:
+        // the inner space is left untouched.
+        let mut m = EchoMatcher::new();
+        let buf = "fix the the bug ";
+        m.apply_input(InputEvent::Lints {
+            issues: vec![issue(4, 11, "the the")],
+            buffer_chars: buf.chars().count(),
+            buffer_text: buf.into(),
+            buffer_cursor: buf.chars().count(),
+        });
+        feed_history(&mut m, 0, 0, buf);
+        let out = paint_plain(&m, &screen_with_cursor(80, 24, 0, 16));
+        assert_eq!(
+            underlined_cells(&out, (0, 16)),
+            vec![
+                (0, 4, 't'), (0, 5, 'h'), (0, 6, 'e'),
+                (0, 8, 't'), (0, 9, 'h'), (0, 10, 'e'),
+            ],
+        );
+    }
+
+    #[test]
+    fn phrase_lint_clears_fully_when_the_host_skipped_the_space() {
+        // Ink hosts (Claude Code) draw spaces by moving the cursor, so the
+        // grid has no cell between the two words. Clearing the lint must
+        // still finish in one pass — no span carried forward forever
+        // because a space cell can never be restored from the grid.
+        let mut m = EchoMatcher::new();
+        let buf = "the the ";
+        m.apply_input(InputEvent::Lints {
+            issues: vec![issue(0, 7, "the the")],
+            buffer_chars: 8,
+            buffer_text: buf.into(),
+            buffer_cursor: 8,
+        });
+        feed_history(&mut m, 0, 0, "the");
+        feed_history(&mut m, 0, 4, "the");
+        let mut g = PaintGate::new();
+        let screen = screen_with_cursor(80, 24, 0, 8);
+        let first = build_annotations_with(&mut g, &m, &screen, true, PLAIN, false);
+        assert_eq!(underlined_cells(&first, (0, 8)).len(), 6, "{first:?}");
+        assert_eq!(g.painted_len(), 2, "one painted run per word");
+
+        m.apply_input(InputEvent::Lints {
+            issues: vec![],
+            buffer_chars: 8,
+            buffer_text: buf.into(),
+            buffer_cursor: 8,
+        });
+        let clear = build_annotations_with(&mut g, &m, &screen, true, PLAIN, false);
+        assert!(String::from_utf8_lossy(&clear).contains("\x1b[24mthe"), "{clear:?}");
+        assert_eq!(g.painted_len(), 0, "clear must complete, not carry forward");
     }
 
     #[test]

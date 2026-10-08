@@ -661,6 +661,7 @@ mod tests {
             suggestions: suggestions.iter().map(|s| (*s).into()).collect(),
             category: IssueCategory::Spelling,
             priority: 50,
+            rule: "SpellCheck".into(),
         }
     }
 

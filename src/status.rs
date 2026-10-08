@@ -102,6 +102,7 @@ mod tests {
             suggestions: vec![format!("{word}-fixed")],
             category: IssueCategory::Spelling,
             priority: 50,
+            rule: "SpellCheck".into(),
         }
     }
 

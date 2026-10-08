@@ -223,6 +223,12 @@ impl EchoMatcher {
         &self.lints
     }
 
+    /// Forget the current lints, keeping the buffer and grid. With nothing
+    /// to paint, the painter's next pass clears whatever it underlined.
+    pub fn clear_lints(&mut self) {
+        self.lints.clear();
+    }
+
     /// The latest screen position where the last non-empty line of
     /// buffer text is rendered contiguously on a single row. Returns
     /// the position of the *first* character of the match. None if
@@ -685,6 +691,7 @@ mod tests {
             suggestions: vec!["the".into()],
             category: crate::spell::IssueCategory::Spelling,
             priority: 50,
+            rule: "SpellCheck".into(),
         }];
         m.apply_input(InputEvent::Lints { issues: issues.clone(), buffer_chars: 3, buffer_text: "teh".into(), buffer_cursor: 0 });
         assert_eq!(m.lints().len(), 1);
@@ -705,6 +712,7 @@ mod tests {
             suggestions: vec!["the".into()],
             category: crate::spell::IssueCategory::Spelling,
             priority: 50,
+            rule: "SpellCheck".into(),
         }];
         m.apply_input(InputEvent::Lints { issues, buffer_chars: 3, buffer_text: "teh".into(), buffer_cursor: 0 });
         m.apply_input(InputEvent::Boundary);
@@ -918,6 +926,7 @@ mod tests {
                 suggestions: vec!["the".into()],
                 category: crate::spell::IssueCategory::Spelling,
                 priority: 50,
+                rule: "SpellCheck".into(),
             }],
             buffer_chars: 3,
             buffer_text: "teh".into(),

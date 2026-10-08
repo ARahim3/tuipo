@@ -96,6 +96,10 @@ tuipo init --dry-run  # just print the line it would add, don't write anything
 Open a new terminal and you're covered everywhere. (The hook guards against
 re-entry, so it won't wrap itself.)
 
+Need a break from it? `tuipo off` switches it off everywhere — open tabs stop
+underlining within a second and new tabs start without it — and `tuipo on` brings it
+back. No need to touch your shell config.
+
 ### Or just for one app
 
 If you'd rather not have it always-on and only want it inside a specific app — say,
@@ -143,13 +147,15 @@ file) — e.g. `TUIPO_PAINT_OFF=1`, `TUIPO_TAB_FIX=1`, `TUIPO_GRAMMAR=1`. Run
 
 ## What about grammar?
 
-Spelling is the default; grammar is opt-in and kept deliberately small. Terminal
-prompts aren't essays — they're full of imperatives, lowercase starts, fragments,
-and no end punctuation, so broad grammar checking misfires constantly. With
-`grammar = true`, tuipo surfaces only a narrow, high-confidence slice (subject–verb
-agreement, malapropisms, eggcorns, common usage slips) and leaves the noisy stuff
-off. It's tuned for how people actually type in a terminal, not lifted from a
-desktop grammar checker.
+Spelling is the default, along with a few slips that are never intentional: doubled
+words ("the the"), the wrong article ("an new", "a hour"), and "could of" / "should
+of". Grammar is opt-in and kept deliberately small. Terminal prompts aren't essays —
+they're full of imperatives, lowercase starts, fragments, and no end punctuation, so
+broad grammar checking misfires constantly. With `grammar = true`, tuipo surfaces
+only a narrow, high-confidence slice (subject–verb agreement, malapropisms,
+eggcorns, mixed-up their/they're, then/than, its/it's, lets/let's, and common usage
+slips) and leaves the noisy stuff off. It's tuned for how people actually type in a
+terminal, not lifted from a desktop grammar checker.
 
 ## How it works
 
@@ -169,6 +175,12 @@ anything unusual.
 No. Passthrough is byte-for-byte and the app behaves exactly as if you launched it
 directly. Painting only happens during idle pauses, when the app is idle too.
 
+**How much memory does it use?**
+About 2 MB per terminal while you're not typing. The spell checker (Harper and its
+dictionary, ~130–200 MB) runs in a helper process, `tuipo __engine`, that starts
+when you begin typing and exits about a minute after you stop — so a pile of open
+terminals costs almost nothing. `TUIPO_ENGINE_IDLE_SECS` changes the delay.
+
 **Will it mess with tab-completion or my keybindings?**
 No. Tab passes straight through to the app by default, so shell completion, vim
 indent, and slash-command menus keep working. Fixing is opt-in, and even then it
@@ -187,7 +199,9 @@ in regularly can go in `~/.config/tuipo/dict.txt` so they're never flagged again
 If Harper grows other languages, tuipo inherits them.
 
 **How do I turn it off for a bit?**
-`TUIPO_PAINT_OFF=1 tuipo -- <cmd>`, or set `paint = false`.
+`tuipo off`, then `tuipo on` when you want it back. To keep tuipo running but hide
+the underlines, set `paint = false` (or start one session with
+`TUIPO_PAINT_OFF=1 tuipo -- <cmd>`).
 
 ## Uninstall
 

@@ -97,6 +97,11 @@ impl InputBuffer {
         self.cursor
     }
 
+    /// Cursor as a char offset — the unit lint spans use.
+    pub fn cursor_chars(&self) -> usize {
+        self.text[..self.cursor].chars().count()
+    }
+
     pub fn version(&self) -> u64 {
         self.version
     }

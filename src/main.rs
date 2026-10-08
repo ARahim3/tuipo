@@ -8,10 +8,12 @@ mod config_tui;
 mod debug;
 mod dict;
 mod echo;
+mod engine;
 mod event;
 mod fix;
 mod init;
 mod input;
+mod lint_worker;
 mod paint;
 mod picker;
 mod pty;
@@ -30,13 +32,25 @@ struct Args {
 }
 
 fn main() {
-    term::install_panic_hook();
     // Handle subcommands before clap parses, because clap's
     // `trailing_var_arg` would otherwise consume `init` as part of the
     // wrapped command. We intercept the first positional arg.
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // The spell engine child (spawned by the lint worker) speaks a binary
+    // protocol on stdin/stdout and never touches the terminal, so it skips
+    // the raw-mode panic hook and config loading entirely.
+    if argv.first().map(String::as_str) == Some(engine::ENGINE_SUBCOMMAND) {
+        std::process::exit(engine::run_server());
+    }
+    term::install_panic_hook();
     if argv.first().map(String::as_str) == Some("init") {
         std::process::exit(init::run_init(&argv[1..]));
+    }
+    if argv.first().map(String::as_str) == Some("off") {
+        std::process::exit(init::run_off());
+    }
+    if argv.first().map(String::as_str) == Some("on") {
+        std::process::exit(init::run_on());
     }
     if argv.first().map(String::as_str) == Some("config") {
         // Config is loaded inside the TUI from the file directly, so we
@@ -53,6 +67,9 @@ fn main() {
         std::process::exit(0);
     }
     let args = Args::parse();
+    if config::switched_off() {
+        run_unwrapped(&args.command);
+    }
     // Load the persistent config once, before any thread starts. Env vars
     // still override individual settings — see `config::Config` for the
     // precedence rules.
@@ -66,11 +83,27 @@ fn main() {
     }
 }
 
+/// `tuipo off` is in effect: become the command instead of wrapping it, as
+/// if tuipo weren't installed. `TUIPO_ACTIVE` stops the shell hook in a
+/// wrapped shell's rc file from launching tuipo again (an exec loop).
+fn run_unwrapped(command: &[String]) -> ! {
+    use std::os::unix::process::CommandExt;
+    let err = std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .env("TUIPO_ACTIVE", "1")
+        .exec();
+    eprintln!("tuipo: failed to run `{}`: {err}", command[0]);
+    std::process::exit(127);
+}
+
 fn print_help() {
     println!("tuipo — Grammarly-style spell-check overlay for any TUI\n");
     println!("USAGE:");
     println!("  tuipo -- <command> [args...]    Wrap a command under tuipo");
     println!("  tuipo init [--dry-run]          Install shell hook for auto-wrap");
+    println!("  tuipo off                       Switch tuipo off: open tabs stop underlining,");
+    println!("                                   new tabs start without it");
+    println!("  tuipo on                        Switch it back on");
     println!("  tuipo config                    Interactive TUI to edit settings");
     println!("  tuipo config --print            Print current config as TOML");
     println!("  tuipo config --path             Print the config file path");
@@ -92,4 +125,5 @@ fn print_help() {
     println!("  TUIPO_GRAMMAR=1                 Opt in to narrow grammar lints");
     println!("  TUIPO_PLAIN_UNDERLINE=1         Force plain underline (Apple Terminal-safe)");
     println!("  TUIPO_FANCY_UNDERLINE=1         Force curly red underline (overrides Auto)");
+    println!("  TUIPO_ENGINE_IDLE_SECS=<n>      Stop the spell engine after n idle seconds (60)");
 }

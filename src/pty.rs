@@ -3,10 +3,13 @@
 //!
 //! Threading layout:
 //! - **winch** thread: forwards SIGWINCH to PTY.
-//! - **stdin pump** thread: reads user input, updates the harper-side
-//!   `InputState`, emits `RenderEvent::Input` *before* writing each byte to
-//!   the PTY so input events reach the channel ahead of any line-discipline
-//!   echo.
+//! - **stdin pump** thread: reads user input, updates the `InputState`
+//!   buffer, emits `RenderEvent::Input` *before* writing each byte to the
+//!   PTY so input events reach the channel ahead of any line-discipline
+//!   echo. It never runs harper: buffer changes go to the lint worker.
+//! - **lint worker** thread (`lint_worker.rs`): owns the spell engine —
+//!   a `tuipo __engine` child process started on demand and stopped when
+//!   idle — and emits `InputEvent::Lints` as results arrive.
 //! - **pty reader** thread: reads from PTY master, emits `RenderEvent::PtyBytes`.
 //! - **tick** thread: emits `RenderEvent::Tick` every `TICK_INTERVAL`.
 //! - **main / render** thread: consumes `RenderEvent`s from one channel,
@@ -25,10 +28,12 @@ use std::time::{Duration, Instant};
 
 use crate::buffer::FeedOutcome;
 use crate::debug::DebugLog;
+use crate::dict::CustomDict;
 use crate::echo::EchoMatcher;
 use crate::event::{InputEvent, RenderEvent, ScreenEvent};
 use crate::fix::{Fix, try_tab_fix};
 use crate::input::InputState;
+use crate::lint_worker::{LintHandle, LintSwitch};
 use crate::paint::{self, PaintGate};
 use crate::screen::ScreenObserver;
 use crate::status;
@@ -39,6 +44,14 @@ use crate::term::RawModeGuard;
 /// stops typing lands within ~50ms of the pause becoming "long enough."
 const TICK_INTERVAL: Duration = Duration::from_millis(50);
 
+/// How long Tab-fix / the picker wait for lints matching the live buffer.
+/// Lints normally land within milliseconds of a keystroke, so this only
+/// bites when the engine is cold-starting (~0.2 s) or wedged.
+const FIX_SYNC_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How often a running session checks the `tuipo off` switch.
+const SWITCH_POLL: Duration = Duration::from_millis(500);
+
 /// Opt-in switch for Tab→quick-fix behavior. Default is off so that wrapping
 /// shells / TUIs see Tab with its normal meaning. Enabled by
 /// `tab_fix = true` in `~/.config/tuipo/config.toml`, or by setting
@@ -46,15 +59,6 @@ const TICK_INTERVAL: Duration = Duration::from_millis(50);
 /// implicitly turns this on — the picker only opens via Tab.
 fn tab_fix_enabled() -> bool {
     crate::config::get().tab_fix_enabled()
-}
-
-/// Convert a byte-offset cursor to a char-offset cursor within `text`.
-/// `Buffer::cursor()` is in bytes (because it indexes into the underlying
-/// `String`), but lint spans are in chars — they have to be comparable
-/// for the picker's hover detection.
-fn char_cursor_in(text: &str, byte_cursor: usize) -> usize {
-    let clamped = byte_cursor.min(text.len());
-    text[..clamped].chars().count()
 }
 
 pub fn run(command: Vec<String>) -> Result<i32> {
@@ -112,13 +116,16 @@ pub fn run(command: Vec<String>) -> Result<i32> {
     // consumer (render loop).
     let (event_tx, event_rx) = mpsc::channel::<RenderEvent>();
 
+    let lints = LintHandle::spawn(event_tx.clone(), CustomDict::from_default_path());
+    let lint_switch = lints.switch();
+
     spawn_winch_thread(Arc::clone(&master), event_tx.clone());
-    spawn_stdin_pump(writer, event_tx.clone());
+    spawn_stdin_pump(writer, event_tx.clone(), lints);
     spawn_pty_reader(reader, event_tx.clone());
     spawn_tick(event_tx.clone());
     drop(event_tx); // render loop holds the last receiver only
 
-    render_loop(ScreenObserver::new(cols, rows), event_rx);
+    render_loop(ScreenObserver::new(cols, rows), event_rx, lint_switch);
 
     let status = child.wait().context("failed to wait for child")?;
     let exit_code = status.exit_code() as i32;
@@ -165,8 +172,12 @@ fn spawn_winch_thread(
     });
 }
 
-fn spawn_stdin_pump(writer: Box<dyn Write + Send>, event_tx: mpsc::Sender<RenderEvent>) {
-    thread::spawn(move || pump_stdin_to_pty(writer, event_tx));
+fn spawn_stdin_pump(
+    writer: Box<dyn Write + Send>,
+    event_tx: mpsc::Sender<RenderEvent>,
+    lints: LintHandle,
+) {
+    thread::spawn(move || pump_stdin_to_pty(writer, event_tx, lints));
 }
 
 /// Minimal escape-sequence parser used by the stdin pump while the
@@ -221,8 +232,12 @@ impl PickerCtx {
     }
 }
 
-fn pump_stdin_to_pty(mut writer: Box<dyn Write + Send>, event_tx: mpsc::Sender<RenderEvent>) {
-    let mut state = InputState::new();
+fn pump_stdin_to_pty(
+    mut writer: Box<dyn Write + Send>,
+    event_tx: mpsc::Sender<RenderEvent>,
+    lints: LintHandle,
+) {
+    let mut state = InputState::new(lints);
     let debug = DebugLog::from_env();
     let mut buf = [0u8; 4096];
     let stdin = std::io::stdin();
@@ -242,14 +257,7 @@ fn pump_stdin_to_pty(mut writer: Box<dyn Write + Send>, event_tx: mpsc::Sender<R
                 // GH #1. A paste isn't interactive input, so none of the
                 // picker / Tab-fix machinery in `handle_byte` applies.
                 if chunk_looks_like_paste(chunk) {
-                    if !handle_paste_chunk(
-                        chunk,
-                        &mut writer,
-                        &mut state,
-                        &event_tx,
-                        &debug,
-                        &mut picker,
-                    ) {
+                    if !handle_paste_chunk(chunk, &mut writer, &mut state, &debug, &mut picker) {
                         break;
                     }
                     continue;
@@ -294,10 +302,10 @@ fn pump_stdin_to_pty(mut writer: Box<dyn Write + Send>, event_tx: mpsc::Sender<R
 /// [`chunk_looks_like_paste`]). Reconstructs the input buffer without
 /// spell-checking each intermediate prefix, forwards the whole chunk to
 /// the child *before* the spell pass so the wrapped app shows
-/// "[Pasted N lines]" without delay, then runs harper exactly once and
-/// emits a single `Lints` snapshot. This is the fix for the multi-second
-/// paste hang (GH #1): per-byte linting is O(n²) harper passes and stalls
-/// byte forwarding until each finishes.
+/// "[Pasted N lines]" without delay, then queues exactly one lint of the
+/// final buffer, which comes back as a single `Lints` snapshot. This is
+/// the fix for the multi-second paste hang (GH #1): per-byte linting is
+/// O(n²) harper passes and stalled byte forwarding until each finished.
 ///
 /// Returns `false` if writing to the PTY failed (the caller should stop
 /// the pump).
@@ -305,7 +313,6 @@ fn handle_paste_chunk(
     chunk: &[u8],
     writer: &mut Box<dyn Write + Send>,
     state: &mut InputState,
-    event_tx: &mpsc::Sender<RenderEvent>,
     debug: &DebugLog,
     picker: &mut PickerCtx,
 ) -> bool {
@@ -324,25 +331,16 @@ fn handle_paste_chunk(
     if writer.flush().is_err() {
         return false;
     }
-    // One harper pass over the final buffer, then a single Lints event.
+    // One lint of the final buffer, answered by a single Lints snapshot.
     // The painter anchors off `buffer_text` + the screen grid, so a lone
     // snapshot is all it needs (the per-byte `UserChar` events the normal
     // path emits only feed the non-load-bearing legacy pairing + the
     // paint throttle, neither of which matters for a paste).
     state.refresh();
-    let buffer_text = state.buffer().text().to_string();
-    let buffer_chars = buffer_text.chars().count();
-    let buffer_cursor = char_cursor_in(&buffer_text, state.buffer().cursor());
     // Mirror the grow/shrink tracker the per-byte path maintains, so a Tab
     // right after a paste evaluates the picker gate against the right
     // buffer length.
-    picker.note_buffer(buffer_chars);
-    let _ = event_tx.send(RenderEvent::Input(InputEvent::Lints {
-        issues: state.issues().to_vec(),
-        buffer_chars,
-        buffer_text,
-        buffer_cursor,
-    }));
+    picker.note_buffer(state.buffer().text().chars().count());
     if debug.enabled() {
         debug.log_input(state);
     }
@@ -447,13 +445,12 @@ fn picker_dismiss(picker: &mut PickerCtx, event_tx: &mpsc::Sender<RenderEvent>) 
 /// when engagement succeeded (the caller should NOT forward Tab to the
 /// PTY in that case).
 fn picker_engage(
-    state: &InputState,
+    state: &mut InputState,
     picker: &mut PickerCtx,
     event_tx: &mpsc::Sender<RenderEvent>,
 ) -> bool {
-    let buffer_text = state.buffer().text();
-    let buffer_cursor = char_cursor_in(buffer_text, state.buffer().cursor());
-    let buffer_chars = buffer_text.chars().count();
+    let buffer_cursor = state.buffer().cursor_chars();
+    let buffer_chars = state.buffer().text().chars().count();
     // Don't hijack Tab while the user is typing forward at end-of-buffer —
     // that's exactly when the wrapped child (a shell, etc.) wants Tab for
     // its own completion. Engage only once the user shows edit intent.
@@ -461,6 +458,11 @@ fn picker_engage(
     // tooltip is (or would be) showing. See `picker::typing_forward_at_end`
     // and decision #11.
     if crate::picker::typing_forward_at_end(buffer_cursor, buffer_chars, picker.buffer_shrank) {
+        return false;
+    }
+    // Lints arrive asynchronously; pick only from ones computed for the
+    // live buffer.
+    if !state.sync_issues(FIX_SYNC_TIMEOUT) {
         return false;
     }
     let grammar_enabled = crate::config::get().grammar_enabled();
@@ -508,6 +510,7 @@ fn picker_apply(
     // time; lints may have shifted if the user backspaced inside the
     // word during a passive hover, but in engaged mode the user only
     // presses arrows/Enter/Esc, so the span shouldn't move.
+    state.sync_issues(FIX_SYNC_TIMEOUT);
     let issue_clone = state
         .issues()
         .iter()
@@ -532,8 +535,8 @@ fn picker_apply(
         return false;
     };
     let _ = apply_fix(writer, state, event_tx, debug, &fix);
-    // Close the picker after applying (apply_fix already sent Lints +
-    // ForcePaint, so the underline + overlay both clear).
+    // Close the picker after applying (apply_fix waited for the post-fix
+    // Lints and sent ForcePaint, so the underline + overlay both clear).
     let _ = event_tx.send(RenderEvent::Input(InputEvent::PickerState(None)));
     let _ = event_tx.send(RenderEvent::ForcePaint);
     picker.esc = EscState::Ground;
@@ -561,6 +564,10 @@ fn handle_byte(
     // menus use); Shift-Tab cycles backward via `\x1b[Z`.
     // Apply: Enter only. Tab used to apply too, but cycling is more
     // discoverable and Enter is unambiguous for "I picked this one."
+    // `tuipo off` arrived while the picker was open: let the keys go.
+    if picker.engaged.is_some() && !state.lints_enabled() {
+        picker_dismiss(picker, event_tx);
+    }
     if picker.engaged.is_some() {
         match (picker.esc, byte) {
             (EscState::Ground, 0x1B) => {
@@ -631,20 +638,27 @@ fn handle_byte(
     // Tab: spell-fix path. If the picker is enabled and we can identify
     // a target lint, engage the picker instead of auto-applying. Tab-fix
     // without picker still auto-applies the top suggestion.
-    if byte == b'\t' && tab_fix_enabled() {
+    if byte == b'\t' && tab_fix_enabled() && state.lints_enabled() {
         if crate::config::get().picker_enabled() {
             if picker_engage(state, picker, event_tx) {
                 return;
             }
-        } else if let Some(fix) = try_tab_fix(state) {
-            if apply_fix(writer, state, event_tx, debug, &fix).is_err() {
-                *send_failed = true;
+        } else {
+            // Lints arrive asynchronously; fix only from ones computed
+            // for the live buffer.
+            state.sync_issues(FIX_SYNC_TIMEOUT);
+            if let Some(fix) = try_tab_fix(state) {
+                if apply_fix(writer, state, event_tx, debug, &fix).is_err() {
+                    *send_failed = true;
+                }
+                return;
             }
-            return;
         }
     }
 
     let cursor_before = state.buffer().cursor();
+    // Hands any change to the lint worker; its `Lints` snapshot reaches
+    // the render loop on its own once harper has looked at the text.
     let outcome = state.feed_bytes(&[byte]);
     match outcome {
         FeedOutcome::Updated => {
@@ -656,26 +670,19 @@ fn handle_byte(
                     char_offset,
                 }));
             }
-            let buffer_text = state.buffer().text().to_string();
-            let buffer_chars = buffer_text.chars().count();
-            let buffer_cursor = char_cursor_in(&buffer_text, state.buffer().cursor());
             // Track grow/shrink so the next Tab knows whether the user is
             // typing forward (Tab → child completion) or editing back into
             // a word (Tab → engage the picker).
-            picker.note_buffer(buffer_chars);
-            let _ = event_tx.send(RenderEvent::Input(InputEvent::Lints {
-                issues: state.issues().to_vec(),
-                buffer_chars,
-                buffer_text,
-                buffer_cursor,
-            }));
+            picker.note_buffer(state.buffer().text().chars().count());
             if debug.enabled() {
                 debug.log_input(state);
             }
         }
         FeedOutcome::Boundary => {
+            // `feed_bytes` already sent `Boundary` to the render loop — via
+            // the lint handle, so it's ordered after any lint result for
+            // the line just submitted.
             picker.reset_buffer_tracking();
-            let _ = event_tx.send(RenderEvent::Input(InputEvent::Boundary));
             if debug.enabled() {
                 debug.log_boundary();
             }
@@ -689,8 +696,8 @@ fn handle_byte(
 
 /// Apply a tab-fix: inject (optional) arrow keys + backspaces + replacement
 /// bytes into the PTY's stdin and into our local buffer in lockstep,
-/// emitting `UserChar`/`Lints` events so the matcher and renderer track
-/// the corrected text. Arrow keys are only used by the mid-buffer picker
+/// emitting `UserChar` events (the lint worker follows with the post-fix
+/// `Lints`) so the matcher and renderer track the corrected text. Arrow keys are only used by the mid-buffer picker
 /// case where the user moved their cursor into a flagged word — we walk
 /// the cursor to `char_end` before backspacing so we don't delete the
 /// wrong chars.
@@ -741,16 +748,11 @@ fn apply_fix(
         }
         writer.write_all(&[byte])?;
     }
-    // Lint snapshot is now fresh; tell the matcher.
-    let buffer_text = state.buffer().text().to_string();
-    let buffer_chars = buffer_text.chars().count();
-    let buffer_cursor = char_cursor_in(&buffer_text, state.buffer().cursor());
-    let _ = event_tx.send(RenderEvent::Input(InputEvent::Lints {
-        issues: state.issues().to_vec(),
-        buffer_chars,
-        buffer_text,
-        buffer_cursor,
-    }));
+    // Wait for the lint worker to publish the post-fix snapshot (a few ms:
+    // the engine is warm, it just produced the lint being fixed). Its
+    // `Lints` event is queued before this returns, so the ForcePaint below
+    // paints against the fixed text.
+    state.sync_issues(FIX_SYNC_TIMEOUT);
     // Ask the render loop to paint synchronously so the underline on the
     // just-fixed word vanishes in lockstep with the Tab press. Without
     // this the stale-underline clear has to wait for the next 50ms tick,
@@ -798,7 +800,11 @@ fn spawn_tick(event_tx: mpsc::Sender<RenderEvent>) {
     });
 }
 
-fn render_loop(mut observer: ScreenObserver, event_rx: mpsc::Receiver<RenderEvent>) {
+fn render_loop(
+    mut observer: ScreenObserver,
+    event_rx: mpsc::Receiver<RenderEvent>,
+    lint_switch: LintSwitch,
+) {
     let mut matcher = EchoMatcher::new();
     let mut gate = PaintGate::new();
     let mut overlay_gate = crate::picker::OverlayGate::new();
@@ -809,6 +815,11 @@ fn render_loop(mut observer: ScreenObserver, event_rx: mpsc::Receiver<RenderEven
     let mut last_screen_version = observer.state().version;
     let mut last_matcher_positions = 0usize;
     let hover_window = crate::config::get().hover_duration();
+    // `tuipo off` / `tuipo on`, checked every `SWITCH_POLL`. While off,
+    // the lints are dropped before every paint, so the painter clears what
+    // it drew and draws nothing new; the lint worker is paused too.
+    let mut switched_on = true;
+    let mut switch_checked = Instant::now();
 
     while let Ok(ev) = event_rx.recv() {
         match ev {
@@ -911,6 +922,9 @@ fn render_loop(mut observer: ScreenObserver, event_rx: mpsc::Receiver<RenderEven
                 }
             }
             RenderEvent::ForcePaint => {
+                if !switched_on {
+                    matcher.clear_lints();
+                }
                 // Synchronous paint, used by Tab-fix to clear the stale
                 // underline immediately. The previous Lints event (sent
                 // right before ForcePaint from the same thread) already
@@ -925,6 +939,22 @@ fn render_loop(mut observer: ScreenObserver, event_rx: mpsc::Receiver<RenderEven
                 );
             }
             RenderEvent::Tick => {
+                if switch_checked.elapsed() >= SWITCH_POLL {
+                    switch_checked = Instant::now();
+                    let on = !crate::config::switched_off();
+                    if on != switched_on {
+                        switched_on = on;
+                        lint_switch.set(on);
+                        overlay_gate.set_engaged(None);
+                        gate.mark_dirty();
+                        if debug.enabled() {
+                            debug.log_switch(on);
+                        }
+                    }
+                }
+                if !switched_on {
+                    matcher.clear_lints();
+                }
                 // Re-evaluate the picker hover before drawing — cursor
                 // may have been idle long enough that the tooltip should
                 // appear (or vanish if the cursor just moved out).

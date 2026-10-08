@@ -8,3 +8,6 @@ RELEASING.md
 
 # marketing/launch drafts — local only
 /draft/
+
+# macOS Finder metadata
+.DS_Store

@@ -1,6 +1,6 @@
 [package]
 name = "tuipo"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 description = "Grammarly-style spell-check for your terminal — underlines typos as you type in any TUI"
 license = "MIT OR Apache-2.0"
@@ -10,7 +10,7 @@ readme = "README.md"
 keywords = ["spellcheck", "terminal", "tui", "cli", "pty"]
 categories = ["command-line-utilities", "text-processing"]
 authors = ["ARahim3 <erahim3@gmail.com>"]
-exclude = ["/tuipo_demo1.png", "/assets/*.png", "/.github", "/CLAUDE.md", "/config.toml", "/RELEASING.md"]
+exclude = ["/tuipo_demo*.png", "/tuipo_demo.gif", "/assets/*.png", "/.github", "/CLAUDE.md", "/config.toml", "/RELEASING.md", ".DS_Store"]
 
 [[bin]]
 name = "tuipo"
@@ -20,11 +20,11 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
-# Pinned exactly: harper-core 2.5.0 fails to compile on current stable
-# rustc (an upstream type-inference breakage), and a loose `"2"` lets
-# `cargo install tuipo` resolve to it. 2.0.0 is the version every release
-# has shipped and the test suite + grammar slice were tuned against.
-# Revisit when upstream ships a fixed 2.5.x.
+# Pinned exactly: harper-core >= 2.5 needs a much newer rustc (2.11 fails
+# on 1.93, builds on 1.99), so a loose `"2"` would break `cargo install
+# tuipo` for anyone not on a recent toolchain. 2.0.0 is what the test suite
+# and the lint selection in src/spell.rs are tuned against; an upgrade
+# was evaluated in Oct 2026 (see CLAUDE.md backlog) and deferred.
 harper-core = "=2.0.0"
 portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
